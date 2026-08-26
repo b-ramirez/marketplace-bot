@@ -1,10 +1,16 @@
 """
 Marketplace Approval Bot
 -------------------------
-Members use /sell to submit a listing. It goes to a mod-review channel
-for Approve/Deny. Approved listings post to your public marketplace
-channel. Denied listings DM the member with the mod's reason, plus an
-"Edit & Resubmit" button that reopens a pre-filled form.
+Members use /sell, fill out a form for their items/prices and a
+description, then send their photos as a normal message right after
+(drag-and-drop from their device — no links needed). The submission
+goes to a mod-review channel where mods get pinged and can
+Approve/Deny with buttons.
+
+- Approve: creates a new post in your public marketplace FORUM channel
+  (so nothing is visible there until a mod approves it).
+- Deny: DMs the seller the mod's reason, with an "Edit & Resubmit"
+  button that reopens a pre-filled form.
 
 SETUP:
 1. pip install discord.py python-dotenv
@@ -12,14 +18,20 @@ SETUP:
      BOT_TOKEN=your_bot_token_here
      GUILD_ID=your_server_id
      MOD_REVIEW_CHANNEL_ID=channel_id_for_mods_only
-     MARKETPLACE_CHANNEL_ID=channel_id_for_public_listings
+     MARKETPLACE_CHANNEL_ID=channel_id_of_your_FORUM_channel
      MOD_ROLE_ID=role_id_that_can_approve
 3. Invite the bot with "applications.commands" + "bot" scopes and these
-   permissions: Send Messages, Embed Links, Manage Messages (in review channel),
-   Read Message History.
-4. Run: python marketplace_bot.py
+   permissions: Send Messages, Embed Links, Manage Messages (in review
+   channel), Read Message History, Create Posts / Send Messages in
+   Threads (in the marketplace forum).
+4. IMPORTANT for the mod ping to actually show up: go to Server
+   Settings > Roles > (your mod role) and enable "Allow anyone to
+   @mention this role" — otherwise Discord silently won't ping it
+   unless the bot also has the "Mention Everyone" permission.
+5. Run: python marketplace_bot.py
 """
 
+import asyncio
 import os
 import discord
 from discord.ext import commands
@@ -33,6 +45,9 @@ MOD_REVIEW_CHANNEL_ID = int(os.getenv("MOD_REVIEW_CHANNEL_ID", "0"))
 MARKETPLACE_CHANNEL_ID = int(os.getenv("MARKETPLACE_CHANNEL_ID", "0"))
 MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", "0"))
 
+MAX_PHOTOS = 5
+PHOTO_WAIT_SECONDS = 180  # how long we wait for the seller to send photos
+
 intents = discord.Intents.default()
 intents.members = True  # needed to DM users reliably
 
@@ -43,18 +58,64 @@ def is_mod(member: discord.Member) -> bool:
     return any(role.id == MOD_ROLE_ID for role in member.roles)
 
 
-# ---------- Submission / Edit Modal ----------
+def parse_items(raw_text: str):
+    """
+    Parses lines like:
+        Charizard VMAX - $45
+        Pikachu V: $20
+        Random loose item
+    into a list of (item_name, price) tuples. If no delimiter is found,
+    price defaults to "Price not listed".
+    """
+    items = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for delim in (" - ", ":", "—"):
+            if delim in line:
+                name, _, price = line.partition(delim)
+                items.append((name.strip(), price.strip() or "Price not listed"))
+                break
+        else:
+            items.append((line, "Price not listed"))
+    return items
+
+
+def build_listing_embeds(items, description, author, image_urls, status, color):
+    lines = "\n".join(f"• **{name}** — {price}" for name, price in items) or "No items listed."
+    main_embed = discord.Embed(
+        title="New Marketplace Listing",
+        description=description or "No description provided.",
+        color=color,
+    )
+    main_embed.add_field(name="Items & Prices", value=lines, inline=False)
+    main_embed.add_field(
+        name="Seller",
+        value=author.mention if hasattr(author, "mention") else f"<@{author}>",
+        inline=True,
+    )
+    main_embed.set_footer(text=f"Seller ID: {getattr(author, 'id', author)} • {status}")
+
+    embeds = [main_embed]
+    if image_urls:
+        main_embed.set_image(url=image_urls[0])
+        # Extra images become their own bare embeds, forming a gallery
+        for url in image_urls[1:]:
+            extra = discord.Embed(color=color)
+            extra.set_image(url=url)
+            embeds.append(extra)
+    return embeds
+
+
+# ---------- Submission Modal (text fields only) ----------
 
 class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
-    item_name = discord.ui.TextInput(
-        label="Item Name",
-        placeholder="e.g. Charizard VMAX Rainbow Rare",
-        max_length=100,
-    )
-    price = discord.ui.TextInput(
-        label="Price",
-        placeholder="e.g. $45 or trade offers",
-        max_length=50,
+    items_and_prices = discord.ui.TextInput(
+        label="Items & Prices (one per line)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Charizard VMAX Rainbow Rare - $45\nPikachu V - $20 or trade",
+        max_length=1000,
     )
     description = discord.ui.TextInput(
         label="Description / Condition",
@@ -63,69 +124,84 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
         max_length=500,
         required=False,
     )
-    image_url = discord.ui.TextInput(
-        label="Image URL (optional)",
-        placeholder="https://...",
-        required=False,
-    )
 
     def __init__(self, prefill: dict | None = None):
         super().__init__()
         if prefill:
-            self.item_name.default = prefill.get("item_name")
-            self.price.default = prefill.get("price")
+            self.items_and_prices.default = prefill.get("items_and_prices")
             self.description.default = prefill.get("description")
-            self.image_url.default = prefill.get("image_url")
 
     async def on_submit(self, interaction: discord.Interaction):
+        items = parse_items(self.items_and_prices.value)
+
+        await interaction.response.send_message(
+            f"Got your listing! Now **send up to {MAX_PHOTOS} photos** as your next "
+            f"message in this channel (just attach them like normal and hit send). "
+            f"Type `skip` if you don't want to add photos. You have "
+            f"{PHOTO_WAIT_SECONDS // 60} minutes.",
+            ephemeral=True,
+        )
+
+        image_urls: list[str] = []
+
+        def check(m: discord.Message):
+            return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id
+
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=PHOTO_WAIT_SECONDS)
+            if msg.content.strip().lower() != "skip":
+                image_urls = [
+                    att.url for att in msg.attachments
+                    if att.content_type and att.content_type.startswith("image/")
+                ][:MAX_PHOTOS]
+            try:
+                await msg.delete()
+            except (discord.Forbidden, discord.NotFound):
+                pass
+        except asyncio.TimeoutError:
+            try:
+                await interaction.followup.send(
+                    "No photos received in time — submitting your listing without photos.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+
         review_channel = bot.get_channel(MOD_REVIEW_CHANNEL_ID)
         if review_channel is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Couldn't reach the mod review channel. Contact an admin.",
                 ephemeral=True,
             )
             return
 
-        embed = build_listing_embed(
-            item_name=self.item_name.value,
-            price=self.price.value,
+        embeds = build_listing_embeds(
+            items=items,
             description=self.description.value,
-            image_url=self.image_url.value,
             author=interaction.user,
+            image_urls=image_urls,
             status="Pending Review",
             color=discord.Color.yellow(),
         )
 
         view = ReviewView(
             author_id=interaction.user.id,
-            item_name=self.item_name.value,
-            price=self.price.value,
+            items=items,
             description=self.description.value,
-            image_url=self.image_url.value,
+            image_urls=image_urls,
         )
 
+        mod_ping = f"<@&{MOD_ROLE_ID}>" if MOD_ROLE_ID else ""
         await review_channel.send(
-            content="📥 New listing awaiting approval:", embed=embed, view=view
+            content=f"{mod_ping} 📥 New listing awaiting approval:",
+            embeds=embeds,
+            view=view,
         )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Your listing was submitted for mod approval. You'll be notified once reviewed.",
             ephemeral=True,
         )
-
-
-def build_listing_embed(item_name, price, description, image_url, author, status, color):
-    embed = discord.Embed(
-        title=item_name,
-        description=description or "No description provided.",
-        color=color,
-    )
-    embed.add_field(name="Price", value=price, inline=True)
-    embed.add_field(name="Seller", value=author.mention if hasattr(author, "mention") else f"<@{author}>", inline=True)
-    embed.set_footer(text=f"Seller ID: {getattr(author, 'id', author)} • {status}")
-    if image_url:
-        embed.set_image(url=image_url)
-    return embed
 
 
 # ---------- Deny Reason Modal ----------
@@ -149,10 +225,11 @@ class DenyReasonModal(discord.ui.Modal, title="Reason for Denial"):
 
         for child in v.children:
             child.disabled = True
-        embed = self.review_message.embeds[0]
-        embed.color = discord.Color.red()
-        embed.set_footer(text=f"❌ Denied by {interaction.user.display_name}")
-        await self.review_message.edit(embed=embed, view=v)
+        embeds = self.review_message.embeds
+        if embeds:
+            embeds[0].color = discord.Color.red()
+            embeds[0].set_footer(text=f"❌ Denied by {interaction.user.display_name}")
+        await self.review_message.edit(embeds=embeds, view=v)
 
         await interaction.response.send_message("Denial reason sent to the seller.", ephemeral=True)
 
@@ -172,14 +249,12 @@ class ResubmitView(discord.ui.View):
 # ---------- Approve / Deny Buttons ----------
 
 class ReviewView(discord.ui.View):
-    def __init__(self, author_id: int, item_name: str, price: str,
-                 description: str, image_url: str):
+    def __init__(self, author_id: int, items: list, description: str, image_urls: list):
         super().__init__(timeout=None)
         self.author_id = author_id
-        self.item_name = item_name
-        self.price = price
+        self.items = items
         self.description = description
-        self.image_url = image_url
+        self.image_urls = image_urls
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -189,24 +264,28 @@ class ReviewView(discord.ui.View):
             )
             return
 
-        marketplace_channel = bot.get_channel(MARKETPLACE_CHANNEL_ID)
+        forum_channel = bot.get_channel(MARKETPLACE_CHANNEL_ID)
         seller = interaction.guild.get_member(self.author_id)
 
-        embed = build_listing_embed(
-            item_name=self.item_name,
-            price=self.price,
+        embeds = build_listing_embeds(
+            items=self.items,
             description=self.description,
-            image_url=self.image_url,
             author=seller if seller else self.author_id,
+            image_urls=self.image_urls,
             status=f"Approved by {interaction.user.display_name}",
             color=discord.Color.green(),
         )
 
-        if marketplace_channel:
-            await marketplace_channel.send(embed=embed)
+        if isinstance(forum_channel, discord.ForumChannel):
+            first_item = self.items[0][0] if self.items else "New Listing"
+            thread_name = f"{first_item} — {seller.display_name if seller else 'Seller'}"[:100]
+            await forum_channel.create_thread(name=thread_name, embeds=embeds)
+        elif forum_channel:
+            # Fallback if MARKETPLACE_CHANNEL_ID isn't actually a forum channel
+            await forum_channel.send(embeds=embeds)
 
         await self._notify_seller(
-            f"✅ Your listing **{self.item_name}** was approved and posted!"
+            "✅ Your listing was approved and posted to the marketplace!"
         )
         await self._finalize(interaction, discord.Color.green(),
                               f"✅ Approved by {interaction.user.display_name}")
@@ -218,7 +297,6 @@ class ReviewView(discord.ui.View):
                 "You don't have permission to deny listings.", ephemeral=True
             )
             return
-        # Opens a modal to collect the reason; finalization happens in DenyReasonModal.on_submit
         await interaction.response.send_modal(
             DenyReasonModal(review_view=self, review_message=interaction.message)
         )
@@ -236,15 +314,14 @@ class ReviewView(discord.ui.View):
         if not seller:
             return
         embed = discord.Embed(
-            title=f"❌ Listing Denied: {self.item_name}",
+            title="❌ Listing Denied",
             description=f"**Reason:** {reason}",
             color=discord.Color.red(),
         )
+        items_text = "\n".join(f"{name} - {price}" for name, price in self.items)
         prefill = {
-            "item_name": self.item_name,
-            "price": self.price,
+            "items_and_prices": items_text,
             "description": self.description,
-            "image_url": self.image_url,
         }
         try:
             await seller.send(embed=embed, view=ResubmitView(prefill=prefill))
@@ -254,10 +331,11 @@ class ReviewView(discord.ui.View):
     async def _finalize(self, interaction: discord.Interaction, color: discord.Color, footer: str):
         for child in self.children:
             child.disabled = True
-        embed = interaction.message.embeds[0]
-        embed.color = color
-        embed.set_footer(text=footer)
-        await interaction.response.edit_message(embed=embed, view=self)
+        embeds = interaction.message.embeds
+        if embeds:
+            embeds[0].color = color
+            embeds[0].set_footer(text=footer)
+        await interaction.response.edit_message(embeds=embeds, view=self)
 
 
 # ---------- Slash command entry point ----------
