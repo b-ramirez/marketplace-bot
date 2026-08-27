@@ -23,7 +23,8 @@ SETUP:
 3. Invite the bot with "applications.commands" + "bot" scopes and these
    permissions: Send Messages, Embed Links, Manage Messages (in review
    channel), Read Message History, Create Posts / Send Messages in
-   Threads (in the marketplace forum).
+   Threads, and Manage Threads (in the marketplace forum — needed for
+   /sold and /pending to rename and lock listing posts).
 4. IMPORTANT for the mod ping to actually show up: go to Server
    Settings > Roles > (your mod role) and enable "Allow anyone to
    @mention this role" — otherwise Discord silently won't ping it
@@ -33,6 +34,7 @@ SETUP:
 
 import asyncio
 import os
+import re
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -82,7 +84,17 @@ def parse_items(raw_text: str):
     return items
 
 
-def build_listing_embeds(items, description, author, image_urls, status, color):
+def is_image_attachment(att: discord.Attachment) -> bool:
+    if att.content_type and att.content_type.startswith("image/"):
+        return True
+    return att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"))
+
+
+def build_listing_embeds(items, description, author, image_filenames, status, color):
+    """image_filenames are the names of files being sent ALONGSIDE this
+    embed in the same message (via the `files=` kwarg) — referenced with
+    the special attachment://<filename> scheme so the image is permanently
+    hosted on this message rather than pointing at someone else's."""
     lines = "\n".join(f"• **{name}** — {price}" for name, price in items) or "No items listed."
     main_embed = discord.Embed(
         title="New Marketplace Listing",
@@ -98,14 +110,64 @@ def build_listing_embeds(items, description, author, image_urls, status, color):
     main_embed.set_footer(text=f"Seller ID: {getattr(author, 'id', author)} • {status}")
 
     embeds = [main_embed]
-    if image_urls:
-        main_embed.set_image(url=image_urls[0])
+    if image_filenames:
+        main_embed.set_image(url=f"attachment://{image_filenames[0]}")
         # Extra images become their own bare embeds, forming a gallery
-        for url in image_urls[1:]:
+        for filename in image_filenames[1:]:
             extra = discord.Embed(color=color)
-            extra.set_image(url=url)
+            extra.set_image(url=f"attachment://{filename}")
             embeds.append(extra)
     return embeds
+
+
+async def get_thread_seller_id(thread: discord.Thread):
+    """Reads the 'Seller ID: <id>' footer we stamped on the listing embed
+    to figure out who posted it, since the thread's own owner is the bot."""
+    try:
+        msg = thread.starter_message or await thread.fetch_message(thread.id)
+    except (discord.NotFound, discord.HTTPException):
+        return None
+    for embed in msg.embeds:
+        if embed.footer and embed.footer.text:
+            match = re.search(r"Seller ID: (\d+)", embed.footer.text)
+            if match:
+                return int(match.group(1))
+    return None
+
+
+async def mark_listing_status(interaction: discord.Interaction, status: str, lock: bool):
+    channel = interaction.channel
+    if not isinstance(channel, discord.Thread) or channel.parent_id != MARKETPLACE_CHANNEL_ID:
+        await interaction.response.send_message(
+            "This only works inside your listing's post in the marketplace forum.",
+            ephemeral=True,
+        )
+        return
+
+    seller_id = await get_thread_seller_id(channel)
+    if seller_id is None or seller_id != interaction.user.id:
+        await interaction.response.send_message(
+            "Only the seller who posted this listing can update it.", ephemeral=True
+        )
+        return
+
+    base_name = re.sub(r"^\[(SOLD|PENDING)\]\s*", "", channel.name)
+    new_name = f"[{status}] {base_name}"[:100]
+
+    try:
+        if lock:
+            await channel.edit(name=new_name, locked=True, archived=True)
+        else:
+            await channel.edit(name=new_name)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I don't have permission to update this thread — ask a mod to check my "
+            "Manage Threads permission in the marketplace forum.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(f"Marked your listing as **{status}**.", ephemeral=True)
 
 
 # ---------- Submission Modal (text fields only) ----------
@@ -142,7 +204,7 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
             ephemeral=True,
         )
 
-        image_urls: list[str] = []
+        photo_files: list[discord.File] = []
 
         def check(m: discord.Message):
             return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id
@@ -150,10 +212,10 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
         try:
             msg = await bot.wait_for("message", check=check, timeout=PHOTO_WAIT_SECONDS)
             if msg.content.strip().lower() != "skip":
-                image_urls = [
-                    att.url for att in msg.attachments
-                    if att.content_type and att.content_type.startswith("image/")
-                ][:MAX_PHOTOS]
+                image_atts = [a for a in msg.attachments if is_image_attachment(a)][:MAX_PHOTOS]
+                # Re-download and re-attach each image now, BEFORE deleting the
+                # seller's message — otherwise the file becomes unreachable.
+                photo_files = [await att.to_file() for att in image_atts]
             try:
                 await msg.delete()
             except (discord.Forbidden, discord.NotFound):
@@ -175,11 +237,13 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
             )
             return
 
+        image_filenames = [f.filename for f in photo_files]
+
         embeds = build_listing_embeds(
             items=items,
             description=self.description.value,
             author=interaction.user,
-            image_urls=image_urls,
+            image_filenames=image_filenames,
             status="Pending Review",
             color=discord.Color.yellow(),
         )
@@ -188,7 +252,6 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
             author_id=interaction.user.id,
             items=items,
             description=self.description.value,
-            image_urls=image_urls,
         )
 
         mod_ping = f"<@&{MOD_ROLE_ID}>" if MOD_ROLE_ID else ""
@@ -196,6 +259,7 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
             content=f"{mod_ping} 📥 New listing awaiting approval:",
             embeds=embeds,
             view=view,
+            files=photo_files,
         )
 
         await interaction.followup.send(
@@ -221,6 +285,13 @@ class DenyReasonModal(discord.ui.Modal, title="Reason for Denial"):
 
     async def on_submit(self, interaction: discord.Interaction):
         v = self.review_view
+        if v.resolved:
+            await interaction.response.send_message(
+                "This listing has already been reviewed.", ephemeral=True
+            )
+            return
+        v.resolved = True
+
         await v._notify_seller_denied(self.reason.value)
 
         for child in v.children:
@@ -249,29 +320,40 @@ class ResubmitView(discord.ui.View):
 # ---------- Approve / Deny Buttons ----------
 
 class ReviewView(discord.ui.View):
-    def __init__(self, author_id: int, items: list, description: str, image_urls: list):
+    def __init__(self, author_id: int, items: list, description: str):
         super().__init__(timeout=None)
         self.author_id = author_id
         self.items = items
         self.description = description
-        self.image_urls = image_urls
+        self.resolved = False  # guards against double Approve/Deny clicks
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.resolved:
+            await interaction.response.send_message(
+                "This listing has already been reviewed.", ephemeral=True
+            )
+            return
         if not is_mod(interaction.user):
             await interaction.response.send_message(
                 "You don't have permission to approve listings.", ephemeral=True
             )
             return
+        self.resolved = True  # lock immediately, before any awaits, to block a second click
 
         forum_channel = bot.get_channel(MARKETPLACE_CHANNEL_ID)
         seller = interaction.guild.get_member(self.author_id)
+
+        # Re-host the same images (already permanently attached to this review
+        # message) onto the new forum post, rather than reusing URLs.
+        photo_files = [await att.to_file() for att in interaction.message.attachments]
+        image_filenames = [f.filename for f in photo_files]
 
         embeds = build_listing_embeds(
             items=self.items,
             description=self.description,
             author=seller if seller else self.author_id,
-            image_urls=self.image_urls,
+            image_filenames=image_filenames,
             status=f"Approved by {interaction.user.display_name}",
             color=discord.Color.green(),
         )
@@ -279,10 +361,10 @@ class ReviewView(discord.ui.View):
         if isinstance(forum_channel, discord.ForumChannel):
             first_item = self.items[0][0] if self.items else "New Listing"
             thread_name = f"{first_item} — {seller.display_name if seller else 'Seller'}"[:100]
-            await forum_channel.create_thread(name=thread_name, embeds=embeds)
+            await forum_channel.create_thread(name=thread_name, embeds=embeds, files=photo_files)
         elif forum_channel:
             # Fallback if MARKETPLACE_CHANNEL_ID isn't actually a forum channel
-            await forum_channel.send(embeds=embeds)
+            await forum_channel.send(embeds=embeds, files=photo_files)
 
         await self._notify_seller(
             "✅ Your listing was approved and posted to the marketplace!"
@@ -292,6 +374,11 @@ class ReviewView(discord.ui.View):
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.resolved:
+            await interaction.response.send_message(
+                "This listing has already been reviewed.", ephemeral=True
+            )
+            return
         if not is_mod(interaction.user):
             await interaction.response.send_message(
                 "You don't have permission to deny listings.", ephemeral=True
@@ -343,6 +430,16 @@ class ReviewView(discord.ui.View):
 @bot.tree.command(name="sell", description="Submit a marketplace listing for mod approval")
 async def sell(interaction: discord.Interaction):
     await interaction.response.send_modal(ListingModal())
+
+
+@bot.tree.command(name="sold", description="Mark your listing as sold (run this inside your listing's post)")
+async def sold(interaction: discord.Interaction):
+    await mark_listing_status(interaction, status="SOLD", lock=True)
+
+
+@bot.tree.command(name="pending", description="Mark your listing as pending (run this inside your listing's post)")
+async def pending(interaction: discord.Interaction):
+    await mark_listing_status(interaction, status="PENDING", lock=False)
 
 
 @bot.event
