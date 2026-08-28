@@ -212,16 +212,21 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
 
         try:
             msg = await bot.wait_for("message", check=check, timeout=PHOTO_WAIT_SECONDS)
+            print(f"[SUBMIT] received message with {len(msg.attachments)} raw attachments: "
+                  f"{[(a.filename, a.content_type) for a in msg.attachments]}")
             if msg.content.strip().lower() != "skip":
                 image_atts = [a for a in msg.attachments if is_image_attachment(a)][:MAX_PHOTOS]
+                print(f"[SUBMIT] {len(image_atts)} passed is_image_attachment filter")
                 # Re-download and re-attach each image now, BEFORE deleting the
                 # seller's message — otherwise the file becomes unreachable.
                 photo_files = [await att.to_file() for att in image_atts]
+                print(f"[SUBMIT] photo_files built: {[f.filename for f in photo_files]}")
             try:
                 await msg.delete()
             except (discord.Forbidden, discord.NotFound):
                 pass
         except asyncio.TimeoutError:
+            print("[SUBMIT] timed out waiting for photo message")
             try:
                 await interaction.followup.send(
                     "No photos received in time — submitting your listing without photos.",
@@ -239,6 +244,7 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
             return
 
         image_filenames = [f.filename for f in photo_files]
+        print(f"[SUBMIT] about to send review message with {len(photo_files)} file(s): {image_filenames}")
 
         embeds = build_listing_embeds(
             items=items,
