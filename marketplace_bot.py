@@ -342,40 +342,51 @@ class ReviewView(discord.ui.View):
             return
         self.resolved = True  # lock immediately, before any awaits, to block a second click
 
-        forum_channel = bot.get_channel(MARKETPLACE_CHANNEL_ID)
-        seller = interaction.guild.get_member(self.author_id)
+        try:
+            forum_channel = bot.get_channel(MARKETPLACE_CHANNEL_ID)
+            seller = interaction.guild.get_member(self.author_id)
 
-        # Re-fetch the review message directly rather than trusting the
-        # interaction payload, so we reliably get its attachments.
-        review_msg = await interaction.channel.fetch_message(interaction.message.id)
+            # Re-fetch the review message directly rather than trusting the
+            # interaction payload, so we reliably get its attachments.
+            review_msg = await interaction.channel.fetch_message(interaction.message.id)
+            print(f"[APPROVE] forum_channel={forum_channel!r} type={type(forum_channel)}")
+            print(f"[APPROVE] review_msg attachments found: {[a.filename for a in review_msg.attachments]}")
 
-        # Re-host the same images (already permanently attached to this review
-        # message) onto the new forum post, rather than reusing URLs.
-        photo_files = [await att.to_file() for att in review_msg.attachments]
-        image_filenames = [f.filename for f in photo_files]
+            # Re-host the same images (already permanently attached to this review
+            # message) onto the new forum post, rather than reusing URLs.
+            photo_files = [await att.to_file() for att in review_msg.attachments]
+            print(f"[APPROVE] photo_files built: {[f.filename for f in photo_files]}")
+            image_filenames = [f.filename for f in photo_files]
 
-        embeds = build_listing_embeds(
-            items=self.items,
-            description=self.description,
-            author=seller if seller else self.author_id,
-            image_filenames=image_filenames,
-            status=f"Approved by {interaction.user.display_name}",
-            color=discord.Color.green(),
-        )
-
-        if isinstance(forum_channel, discord.ForumChannel):
-            first_item = self.items[0][0] if self.items else "New Listing"
-            thread_name = f"{first_item} — {seller.display_name if seller else 'Seller'}"[:100]
-            # Create the post with just a placeholder first, then send the
-            # real content as a follow-up — attaching files directly on
-            # ForumChannel.create_thread() is unreliable in discord.py.
-            thread_with_message = await forum_channel.create_thread(
-                name=thread_name, content="📋 New marketplace listing:"
+            embeds = build_listing_embeds(
+                items=self.items,
+                description=self.description,
+                author=seller if seller else self.author_id,
+                image_filenames=image_filenames,
+                status=f"Approved by {interaction.user.display_name}",
+                color=discord.Color.green(),
             )
-            await thread_with_message.thread.send(embeds=embeds, files=photo_files)
-        elif forum_channel:
-            # Fallback if MARKETPLACE_CHANNEL_ID isn't actually a forum channel
-            await forum_channel.send(embeds=embeds, files=photo_files)
+
+            if isinstance(forum_channel, discord.ForumChannel):
+                first_item = self.items[0][0] if self.items else "New Listing"
+                thread_name = f"{first_item} — {seller.display_name if seller else 'Seller'}"[:100]
+                # Create the post with just a placeholder first, then send the
+                # real content as a follow-up — attaching files directly on
+                # ForumChannel.create_thread() is unreliable in discord.py.
+                thread_with_message = await forum_channel.create_thread(
+                    name=thread_name, content="📋 New marketplace listing:"
+                )
+                print(f"[APPROVE] thread created: {thread_with_message.thread.id}, sending {len(photo_files)} photo(s)")
+                sent = await thread_with_message.thread.send(embeds=embeds, files=photo_files)
+                print(f"[APPROVE] follow-up message sent, attachments on it: {[a.filename for a in sent.attachments]}")
+            elif forum_channel:
+                # Fallback if MARKETPLACE_CHANNEL_ID isn't actually a forum channel
+                await forum_channel.send(embeds=embeds, files=photo_files)
+        except Exception as e:
+            print(f"[APPROVE] ERROR: {e!r}")
+            import traceback
+            traceback.print_exc()
+            raise
 
         await self._notify_seller(
             "✅ Your listing was approved and posted to the marketplace!"
