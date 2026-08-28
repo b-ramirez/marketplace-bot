@@ -345,9 +345,13 @@ class ReviewView(discord.ui.View):
         forum_channel = bot.get_channel(MARKETPLACE_CHANNEL_ID)
         seller = interaction.guild.get_member(self.author_id)
 
+        # Re-fetch the review message directly rather than trusting the
+        # interaction payload, so we reliably get its attachments.
+        review_msg = await interaction.channel.fetch_message(interaction.message.id)
+
         # Re-host the same images (already permanently attached to this review
         # message) onto the new forum post, rather than reusing URLs.
-        photo_files = [await att.to_file() for att in interaction.message.attachments]
+        photo_files = [await att.to_file() for att in review_msg.attachments]
         image_filenames = [f.filename for f in photo_files]
 
         embeds = build_listing_embeds(
