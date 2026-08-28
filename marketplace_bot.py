@@ -366,7 +366,13 @@ class ReviewView(discord.ui.View):
         if isinstance(forum_channel, discord.ForumChannel):
             first_item = self.items[0][0] if self.items else "New Listing"
             thread_name = f"{first_item} — {seller.display_name if seller else 'Seller'}"[:100]
-            await forum_channel.create_thread(name=thread_name, embeds=embeds, files=photo_files)
+            # Create the post with just a placeholder first, then send the
+            # real content as a follow-up — attaching files directly on
+            # ForumChannel.create_thread() is unreliable in discord.py.
+            thread_with_message = await forum_channel.create_thread(
+                name=thread_name, content="📋 New marketplace listing:"
+            )
+            await thread_with_message.thread.send(embeds=embeds, files=photo_files)
         elif forum_channel:
             # Fallback if MARKETPLACE_CHANNEL_ID isn't actually a forum channel
             await forum_channel.send(embeds=embeds, files=photo_files)
