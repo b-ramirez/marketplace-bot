@@ -52,6 +52,7 @@ PHOTO_WAIT_SECONDS = 180  # how long we wait for the seller to send photos
 
 intents = discord.Intents.default()
 intents.members = True  # needed to DM users reliably
+intents.message_content = True  # needed to see attachments on the seller's photo message
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
