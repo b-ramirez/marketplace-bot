@@ -262,12 +262,14 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
         )
 
         mod_ping = f"<@&{MOD_ROLE_ID}>" if MOD_ROLE_ID else ""
-        await review_channel.send(
+        sent_review_msg = await review_channel.send(
             content=f"{mod_ping} 📥 New listing awaiting approval:",
             embeds=embeds,
             view=view,
             files=photo_files,
         )
+        print(f"[SUBMIT] sent review message id={sent_review_msg.id} in channel={sent_review_msg.channel.id} "
+              f"attachments={[a.filename for a in sent_review_msg.attachments]}")
 
         await interaction.followup.send(
             "Your listing was submitted for mod approval. You'll be notified once reviewed.",
@@ -355,6 +357,7 @@ class ReviewView(discord.ui.View):
             # Re-fetch the review message directly rather than trusting the
             # interaction payload, so we reliably get its attachments.
             review_msg = await interaction.channel.fetch_message(interaction.message.id)
+            print(f"[APPROVE] fetching message id={interaction.message.id} in channel={interaction.channel.id}")
             print(f"[APPROVE] forum_channel={forum_channel!r} type={type(forum_channel)}")
             print(f"[APPROVE] review_msg attachments found: {[a.filename for a in review_msg.attachments]}")
 
