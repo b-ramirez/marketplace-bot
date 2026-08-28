@@ -244,6 +244,11 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
             return
 
         image_filenames = [f.filename for f in photo_files]
+        for f in photo_files:
+            f.fp.seek(0)  # ensure the read position is at the start before uploading
+            f.fp.seek(0, 2)
+            print(f"[SUBMIT] file {f.filename} size={f.fp.tell()} bytes")
+            f.fp.seek(0)
         print(f"[SUBMIT] about to send review message with {len(photo_files)} file(s): {image_filenames}")
 
         embeds = build_listing_embeds(
@@ -364,6 +369,8 @@ class ReviewView(discord.ui.View):
             # Re-host the same images (already permanently attached to this review
             # message) onto the new forum post, rather than reusing URLs.
             photo_files = [await att.to_file() for att in review_msg.attachments]
+            for f in photo_files:
+                f.fp.seek(0)  # ensure the read position is at the start before uploading
             print(f"[APPROVE] photo_files built: {[f.filename for f in photo_files]}")
             image_filenames = [f.filename for f in photo_files]
 
