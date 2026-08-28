@@ -55,6 +55,7 @@ intents.members = True  # needed to DM users reliably
 intents.message_content = True  # needed to see attachments on the seller's photo message
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+print(f"[STARTUP] discord.py version: {discord.__version__}")
 
 
 def is_mod(member: discord.Member) -> bool:
@@ -267,14 +268,21 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
         )
 
         mod_ping = f"<@&{MOD_ROLE_ID}>" if MOD_ROLE_ID else ""
+        # Send the listing (with photos) and the Approve/Deny buttons as TWO
+        # separate messages — combining files= and view= in one send has
+        # been unreliable for actually attaching the files.
         sent_review_msg = await review_channel.send(
             content=f"{mod_ping} 📥 New listing awaiting approval:",
             embeds=embeds,
-            view=view,
             files=photo_files,
         )
         print(f"[SUBMIT] sent review message id={sent_review_msg.id} in channel={sent_review_msg.channel.id} "
               f"attachments={[a.filename for a in sent_review_msg.attachments]}")
+        view.listing_message_id = sent_review_msg.id
+        await review_channel.send(
+            content="👆 Mods, review the listing above:",
+            view=view,
+        )
 
         await interaction.followup.send(
             "Your listing was submitted for mod approval. You'll be notified once reviewed.",
@@ -310,11 +318,21 @@ class DenyReasonModal(discord.ui.Modal, title="Reason for Denial"):
 
         for child in v.children:
             child.disabled = True
-        embeds = self.review_message.embeds
-        if embeds:
-            embeds[0].color = discord.Color.red()
-            embeds[0].set_footer(text=f"❌ Denied by {interaction.user.display_name}")
-        await self.review_message.edit(embeds=embeds, view=v)
+
+        try:
+            listing_msg = await self.review_message.channel.fetch_message(v.listing_message_id)
+            if listing_msg.embeds:
+                listing_msg.embeds[0].color = discord.Color.red()
+                listing_msg.embeds[0].set_footer(text=f"❌ Denied by {interaction.user.display_name}")
+                # Must explicitly pass attachments= on edit, or Discord wipes
+                # the existing photo attachments on this message.
+                await listing_msg.edit(embeds=listing_msg.embeds, attachments=listing_msg.attachments)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+        await self.review_message.edit(
+            content=f"❌ Denied by {interaction.user.display_name}", view=v
+        )
 
         await interaction.response.send_message("Denial reason sent to the seller.", ephemeral=True)
 
@@ -340,6 +358,7 @@ class ReviewView(discord.ui.View):
         self.items = items
         self.description = description
         self.resolved = False  # guards against double Approve/Deny clicks
+        self.listing_message_id = None  # set right after the listing message is sent
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -359,10 +378,10 @@ class ReviewView(discord.ui.View):
             forum_channel = bot.get_channel(MARKETPLACE_CHANNEL_ID)
             seller = interaction.guild.get_member(self.author_id)
 
-            # Re-fetch the review message directly rather than trusting the
-            # interaction payload, so we reliably get its attachments.
-            review_msg = await interaction.channel.fetch_message(interaction.message.id)
-            print(f"[APPROVE] fetching message id={interaction.message.id} in channel={interaction.channel.id}")
+            # Fetch the ORIGINAL listing message (the one with the photos),
+            # not this button message, to reliably get its attachments.
+            review_msg = await interaction.channel.fetch_message(self.listing_message_id)
+            print(f"[APPROVE] fetching message id={self.listing_message_id} in channel={interaction.channel.id}")
             print(f"[APPROVE] forum_channel={forum_channel!r} type={type(forum_channel)}")
             print(f"[APPROVE] review_msg attachments found: {[a.filename for a in review_msg.attachments]}")
 
@@ -456,11 +475,20 @@ class ReviewView(discord.ui.View):
     async def _finalize(self, interaction: discord.Interaction, color: discord.Color, footer: str):
         for child in self.children:
             child.disabled = True
-        embeds = interaction.message.embeds
-        if embeds:
-            embeds[0].color = color
-            embeds[0].set_footer(text=footer)
-        await interaction.response.edit_message(embeds=embeds, view=self)
+
+        # Update the listing message's own embed (color + footer)
+        try:
+            listing_msg = await interaction.channel.fetch_message(self.listing_message_id)
+            if listing_msg.embeds:
+                listing_msg.embeds[0].color = color
+                listing_msg.embeds[0].set_footer(text=footer)
+                # Must explicitly pass attachments= on edit, or Discord wipes
+                # the existing photo attachments on this message.
+                await listing_msg.edit(embeds=listing_msg.embeds, attachments=listing_msg.attachments)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+        await interaction.response.edit_message(content=footer, view=self)
 
 
 # ---------- Slash command entry point ----------
