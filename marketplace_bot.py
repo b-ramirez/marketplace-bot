@@ -33,8 +33,10 @@ SETUP:
 """
 
 import asyncio
+import io
 import os
 import re
+import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -122,9 +124,29 @@ def build_listing_embeds(items, description, author, image_filenames, status, co
     return embeds
 
 
+async def download_embed_images(embeds, filename_prefix="photo"):
+    """Downloads whatever images are actually rendered in these embeds, using
+    the embed's own resolved image URL rather than trusting message.attachments
+    — which has proven unreliable for images referenced via attachment://."""
+    files = []
+    async with aiohttp.ClientSession() as session:
+        for i, embed in enumerate(embeds):
+            if embed.image and embed.image.url and not embed.image.url.startswith("attachment://"):
+                url = embed.image.url
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            ext = url.split("?")[0].rsplit(".", 1)[-1] if "." in url.split("?")[0] else "png"
+                            files.append(discord.File(io.BytesIO(data), filename=f"{filename_prefix}_{i}.{ext}"))
+                        else:
+                            print(f"[DOWNLOAD] status {resp.status} for {url}")
+                except Exception as e:
+                    print(f"[DOWNLOAD] failed to fetch {url}: {e!r}")
+    return files
+
+
 async def get_thread_seller_id(thread: discord.Thread):
-    """Reads the 'Seller ID: <id>' footer we stamped on the listing embed
-    to figure out who posted it, since the thread's own owner is the bot."""
     try:
         msg = thread.starter_message or await thread.fetch_message(thread.id)
     except (discord.NotFound, discord.HTTPException):
@@ -384,10 +406,12 @@ class ReviewView(discord.ui.View):
             print(f"[APPROVE] fetching message id={self.listing_message_id} in channel={interaction.channel.id}")
             print(f"[APPROVE] forum_channel={forum_channel!r} type={type(forum_channel)}")
             print(f"[APPROVE] review_msg attachments found: {[a.filename for a in review_msg.attachments]}")
+            print(f"[APPROVE] review_msg embed image urls: "
+                  f"{[e.image.url if e.image else None for e in review_msg.embeds]}")
 
-            # Re-host the same images (already permanently attached to this review
-            # message) onto the new forum post, rather than reusing URLs.
-            photo_files = [await att.to_file() for att in review_msg.attachments]
+            # Download the actual rendered images from the embeds directly —
+            # message.attachments has proven unreliable for this pattern.
+            photo_files = await download_embed_images(review_msg.embeds, filename_prefix="listing")
             for f in photo_files:
                 f.fp.seek(0)  # ensure the read position is at the start before uploading
             print(f"[APPROVE] photo_files built: {[f.filename for f in photo_files]}")
