@@ -648,42 +648,79 @@ async def pending(interaction: discord.Interaction):
     await mark_listing_status(interaction, status="PENDING", lock=False)
 
 
+def resolve_user_id(raw: str) -> int | None:
+    """Accepts a raw user ID or an @mention like <@123456789012345678> and
+    returns the numeric ID, regardless of whether that user is visible in
+    the current channel."""
+    raw = raw.strip()
+    match = re.match(r"<@!?(\d+)>", raw)
+    if match:
+        return int(match.group(1))
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+
 @bot.tree.command(name="marketplaceban", description="[Mod] Revoke a user's marketplace access, even if they re-accept the rules")
-@discord.app_commands.describe(member="The member to ban from the marketplace")
-async def marketplaceban(interaction: discord.Interaction, member: discord.Member):
+@discord.app_commands.describe(user="Paste their User ID or @mention — they don't need to be visible in this channel")
+async def marketplaceban(interaction: discord.Interaction, user: str):
     if not is_mod(interaction.user):
         await interaction.response.send_message("You don't have permission to do this.", ephemeral=True)
         return
 
-    banned_user_ids.add(member.id)
+    user_id = resolve_user_id(user)
+    if user_id is None:
+        await interaction.response.send_message(
+            "Couldn't understand that — paste their numeric User ID (right-click their "
+            "name anywhere → Copy User ID, requires Developer Mode) or @mention them.",
+            ephemeral=True,
+        )
+        return
+
+    banned_user_ids.add(user_id)
     await save_banned_list()
 
     removed_note = ""
     if MARKETPLACE_ACCESS_ROLE_ID:
-        access_role = interaction.guild.get_role(MARKETPLACE_ACCESS_ROLE_ID)
-        if access_role and access_role in member.roles:
+        member = interaction.guild.get_member(user_id)
+        if member is None:
             try:
-                await member.remove_roles(access_role, reason=f"Marketplace ban by {interaction.user}")
-                removed_note = " Their current marketplace access was also removed."
-            except discord.Forbidden:
-                removed_note = " (Couldn't remove their current access role — check my role position.)"
+                member = await interaction.guild.fetch_member(user_id)
+            except discord.NotFound:
+                member = None
+        if member:
+            access_role = interaction.guild.get_role(MARKETPLACE_ACCESS_ROLE_ID)
+            if access_role and access_role in member.roles:
+                try:
+                    await member.remove_roles(access_role, reason=f"Marketplace ban by {interaction.user}")
+                    removed_note = " Their current marketplace access was also removed."
+                except discord.Forbidden:
+                    removed_note = " (Couldn't remove their current access role — check my role position.)"
 
     await interaction.response.send_message(
-        f"🚫 {member.mention} is now banned from the marketplace.{removed_note}", ephemeral=True
+        f"🚫 <@{user_id}> is now banned from the marketplace.{removed_note}", ephemeral=True
     )
 
 
 @bot.tree.command(name="marketplaceunban", description="[Mod] Restore a user's ability to have marketplace access")
-@discord.app_commands.describe(member="The member to unban from the marketplace")
-async def marketplaceunban(interaction: discord.Interaction, member: discord.Member):
+@discord.app_commands.describe(user="Paste their User ID or @mention")
+async def marketplaceunban(interaction: discord.Interaction, user: str):
     if not is_mod(interaction.user):
         await interaction.response.send_message("You don't have permission to do this.", ephemeral=True)
         return
 
-    banned_user_ids.discard(member.id)
+    user_id = resolve_user_id(user)
+    if user_id is None:
+        await interaction.response.send_message(
+            "Couldn't understand that — paste their numeric User ID or @mention them.",
+            ephemeral=True,
+        )
+        return
+
+    banned_user_ids.discard(user_id)
     await save_banned_list()
     await interaction.response.send_message(
-        f"✅ {member.mention} can have marketplace access again.", ephemeral=True
+        f"✅ <@{user_id}> can have marketplace access again.", ephemeral=True
     )
 
 
