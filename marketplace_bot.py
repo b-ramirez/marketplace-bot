@@ -20,11 +20,15 @@ SETUP:
      MOD_REVIEW_CHANNEL_ID=channel_id_for_mods_only
      MARKETPLACE_CHANNEL_ID=channel_id_of_your_FORUM_channel
      MOD_ROLE_ID=role_id_that_can_approve
+     MARKETPLACE_ACCESS_ROLE_ID=role_id_dyno_grants_for_marketplace_access
 3. Invite the bot with "applications.commands" + "bot" scopes and these
    permissions: Send Messages, Embed Links, Manage Messages (in review
    channel), Read Message History, Create Posts / Send Messages in
    Threads, and Manage Threads (in the marketplace forum — needed for
-   /sold and /pending to rename and lock listing posts).
+   /sold and /pending to rename and lock listing posts), and Manage
+   Roles (server-wide — needed for /marketplaceban to strip access,
+   and the bot's own role must sit ABOVE the marketplace access role
+   in Server Settings > Roles for this to work).
 4. IMPORTANT for the mod ping to actually show up: go to Server
    Settings > Roles > (your mod role) and enable "Allow anyone to
    @mention this role" — otherwise Discord silently won't ping it
@@ -34,6 +38,7 @@ SETUP:
 
 import asyncio
 import io
+import json
 import os
 import re
 import aiohttp
@@ -48,9 +53,14 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 MOD_REVIEW_CHANNEL_ID = int(os.getenv("MOD_REVIEW_CHANNEL_ID", "0"))
 MARKETPLACE_CHANNEL_ID = int(os.getenv("MARKETPLACE_CHANNEL_ID", "0"))
 MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", "0"))
+MARKETPLACE_ACCESS_ROLE_ID = int(os.getenv("MARKETPLACE_ACCESS_ROLE_ID", "0"))
 
 MAX_PHOTOS = 5
 PHOTO_WAIT_SECONDS = 180  # how long we wait for the seller to send photos
+BANNED_LIST_MARKER = "MARKETPLACE_BANNED_LIST"
+
+banned_user_ids: set[int] = set()
+banned_list_message: discord.Message | None = None
 
 intents = discord.Intents.default()
 intents.members = True  # needed to DM users reliably
@@ -62,6 +72,63 @@ print(f"[STARTUP] discord.py version: {discord.__version__}")
 
 def is_mod(member: discord.Member) -> bool:
     return any(role.id == MOD_ROLE_ID for role in member.roles)
+
+
+async def load_or_create_banned_list():
+    """The marketplace ban list is stored as hidden data inside a message in
+    the mods-only review channel — not a visible role — so banned users have
+    no way to tell they've been banned."""
+    global banned_list_message, banned_user_ids
+    review_channel = bot.get_channel(MOD_REVIEW_CHANNEL_ID)
+    if review_channel is None:
+        print("[BANLIST] mod review channel not found, cannot load banned list")
+        return
+
+    async for msg in review_channel.history(limit=200):
+        if msg.author.id == bot.user.id and BANNED_LIST_MARKER in msg.content:
+            banned_list_message = msg
+            try:
+                json_part = msg.content.split("```json")[1].split("```")[0]
+                banned_user_ids = set(json.loads(json_part))
+            except (IndexError, json.JSONDecodeError):
+                banned_user_ids = set()
+            print(f"[BANLIST] loaded {len(banned_user_ids)} banned user(s)")
+            return
+
+    content = f"🔒 {BANNED_LIST_MARKER} — internal data, do not delete\n```json\n[]\n```"
+    banned_list_message = await review_channel.send(content)
+    banned_user_ids = set()
+    print("[BANLIST] created new banned list message")
+
+
+async def save_banned_list():
+    global banned_list_message
+    content = (
+        f"🔒 {BANNED_LIST_MARKER} — internal data, do not delete\n"
+        f"```json\n{json.dumps(sorted(banned_user_ids))}\n```"
+    )
+    if banned_list_message:
+        try:
+            await banned_list_message.edit(content=content)
+            return
+        except discord.NotFound:
+            pass
+    review_channel = bot.get_channel(MOD_REVIEW_CHANNEL_ID)
+    if review_channel:
+        banned_list_message = await review_channel.send(content)
+
+
+async def enforce_ban_on_member(member: discord.Member, reason: str):
+    """Strips marketplace access from a banned member if they currently have it."""
+    if not MARKETPLACE_ACCESS_ROLE_ID:
+        return
+    access_role = member.guild.get_role(MARKETPLACE_ACCESS_ROLE_ID)
+    if access_role and access_role in member.roles:
+        try:
+            await member.remove_roles(access_role, reason=reason)
+            print(f"[BANENFORCE] removed marketplace access from {member.id} ({reason})")
+        except discord.Forbidden:
+            print(f"[BANENFORCE] failed to remove role from {member.id} — check bot role position")
 
 
 def parse_items(raw_text: str):
@@ -581,6 +648,71 @@ async def pending(interaction: discord.Interaction):
     await mark_listing_status(interaction, status="PENDING", lock=False)
 
 
+@bot.tree.command(name="marketplaceban", description="[Mod] Revoke a user's marketplace access, even if they re-accept the rules")
+@discord.app_commands.describe(member="The member to ban from the marketplace")
+async def marketplaceban(interaction: discord.Interaction, member: discord.Member):
+    if not is_mod(interaction.user):
+        await interaction.response.send_message("You don't have permission to do this.", ephemeral=True)
+        return
+
+    banned_user_ids.add(member.id)
+    await save_banned_list()
+
+    removed_note = ""
+    if MARKETPLACE_ACCESS_ROLE_ID:
+        access_role = interaction.guild.get_role(MARKETPLACE_ACCESS_ROLE_ID)
+        if access_role and access_role in member.roles:
+            try:
+                await member.remove_roles(access_role, reason=f"Marketplace ban by {interaction.user}")
+                removed_note = " Their current marketplace access was also removed."
+            except discord.Forbidden:
+                removed_note = " (Couldn't remove their current access role — check my role position.)"
+
+    await interaction.response.send_message(
+        f"🚫 {member.mention} is now banned from the marketplace.{removed_note}", ephemeral=True
+    )
+
+
+@bot.tree.command(name="marketplaceunban", description="[Mod] Restore a user's ability to have marketplace access")
+@discord.app_commands.describe(member="The member to unban from the marketplace")
+async def marketplaceunban(interaction: discord.Interaction, member: discord.Member):
+    if not is_mod(interaction.user):
+        await interaction.response.send_message("You don't have permission to do this.", ephemeral=True)
+        return
+
+    banned_user_ids.discard(member.id)
+    await save_banned_list()
+    await interaction.response.send_message(
+        f"✅ {member.mention} can have marketplace access again.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="marketplacebanlist", description="[Mod] List users currently banned from the marketplace")
+async def marketplacebanlist(interaction: discord.Interaction):
+    if not is_mod(interaction.user):
+        await interaction.response.send_message("You don't have permission to do this.", ephemeral=True)
+        return
+
+    if not banned_user_ids:
+        await interaction.response.send_message("No one is currently banned from the marketplace.", ephemeral=True)
+        return
+
+    lines = "\n".join(f"<@{uid}>" for uid in sorted(banned_user_ids))
+    await interaction.response.send_message(f"**Banned from marketplace:**\n{lines}", ephemeral=True)
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Enforces marketplace bans: if a banned user gains marketplace access
+    again (e.g. re-reacting to Dyno's rules message), strip it right back off."""
+    if not MARKETPLACE_ACCESS_ROLE_ID or after.id not in banned_user_ids:
+        return
+    had_access = any(r.id == MARKETPLACE_ACCESS_ROLE_ID for r in before.roles)
+    has_access = any(r.id == MARKETPLACE_ACCESS_ROLE_ID for r in after.roles)
+    if has_access and not had_access:
+        await enforce_ban_on_member(after, reason="Marketplace ban enforcement")
+
+
 @bot.event
 async def on_ready():
     guild = discord.Object(id=GUILD_ID) if GUILD_ID else None
@@ -589,6 +721,22 @@ async def on_ready():
         await bot.tree.sync(guild=guild)
     else:
         await bot.tree.sync()
+
+    await load_or_create_banned_list()
+
+    # Catch any bans that should have been enforced while the bot was offline
+    # (e.g. someone re-accepted the rules during a restart/redeploy).
+    real_guild = bot.get_guild(GUILD_ID)
+    if real_guild and banned_user_ids:
+        for uid in list(banned_user_ids):
+            member = real_guild.get_member(uid)
+            if member is None:
+                try:
+                    member = await real_guild.fetch_member(uid)
+                except discord.NotFound:
+                    continue
+            await enforce_ban_on_member(member, reason="Marketplace ban enforcement (startup sweep)")
+
     print(f"Logged in as {bot.user} — ready.")
 
 
