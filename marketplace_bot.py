@@ -94,18 +94,18 @@ def is_image_attachment(att: discord.Attachment) -> bool:
     return att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"))
 
 
-def build_listing_embeds(items, description, author, image_filenames, status, color):
+def build_listing_embeds(items, description, author, image_filenames, status, color, listing_type="SELL"):
     """image_filenames are the names of files being sent ALONGSIDE this
     embed in the same message (via the `files=` kwarg) — referenced with
     the special attachment://<filename> scheme so the image is permanently
     hosted on this message rather than pointing at someone else's."""
     lines = "\n".join(f"• **{name}** — {price}" for name, price in items) or "No items listed."
     main_embed = discord.Embed(
-        title="New Marketplace Listing",
+        title=f"{TYPE_TAGS.get(listing_type, '')} {TYPE_TITLES.get(listing_type, 'New Marketplace Listing')}".strip(),
         description=description or "No description provided.",
         color=color,
     )
-    main_embed.add_field(name="Items & Prices", value=lines, inline=False)
+    main_embed.add_field(name=TYPE_ITEMS_LABELS.get(listing_type, "Items & Prices").split(" (")[0], value=lines, inline=False)
     main_embed.add_field(
         name="Seller",
         value=author.mention if hasattr(author, "mention") else f"<@{author}>",
@@ -194,28 +194,68 @@ async def mark_listing_status(interaction: discord.Interaction, status: str, loc
     await interaction.response.send_message(f"Marked your listing as **{status}**.", ephemeral=True)
 
 
+TYPE_TITLES = {
+    "SELL": "New Marketplace Listing",
+    "BUY": "New Buy Request",
+    "TRADE": "New Trade Offer",
+}
+TYPE_TAGS = {"SELL": "[WTS]", "BUY": "[WTB]", "TRADE": "[WTT]"}
+TYPE_ITEMS_LABELS = {
+    "SELL": "Items & Prices (one per line)",
+    "BUY": "Items Wanted & Budget (one per line)",
+    "TRADE": "Items You Have & What You Want (one per line)",
+}
+TYPE_ITEMS_PLACEHOLDERS = {
+    "SELL": "Charizard VMAX Rainbow Rare - $45\nPikachu V - $20 or trade",
+    "BUY": "Charizard VMAX Rainbow Rare - up to $50\nAny Pikachu V - $15-20",
+    "TRADE": "Have: Charizard VMAX / Want: Umbreon VMAX or similar value",
+}
+
+
+class ListingTypeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Sell", description="List an item for sale", emoji="💰", value="SELL"),
+            discord.SelectOption(label="Looking to Buy", description="Post what you're looking to buy", emoji="🔍", value="BUY"),
+            discord.SelectOption(label="Looking to Trade", description="Post what you want to trade", emoji="🔄", value="TRADE"),
+        ]
+        super().__init__(placeholder="What kind of listing is this?", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(ListingModal(listing_type=self.values[0]))
+
+
+class ListingTypeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.add_item(ListingTypeSelect())
+
+
 # ---------- Submission Modal (text fields only) ----------
 
-class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
-    items_and_prices = discord.ui.TextInput(
-        label="Items & Prices (one per line)",
-        style=discord.TextStyle.paragraph,
-        placeholder="Charizard VMAX Rainbow Rare - $45\nPikachu V - $20 or trade",
-        max_length=1000,
-    )
-    description = discord.ui.TextInput(
-        label="Description / Condition",
-        style=discord.TextStyle.paragraph,
-        placeholder="Condition, shipping info, extra details...",
-        max_length=500,
-        required=False,
-    )
+class ListingModal(discord.ui.Modal):
+    def __init__(self, listing_type: str = "SELL", prefill: dict | None = None):
+        super().__init__(title=TYPE_TITLES.get(listing_type, TYPE_TITLES["SELL"]))
+        self.listing_type = listing_type
 
-    def __init__(self, prefill: dict | None = None):
-        super().__init__()
+        self.items_and_prices = discord.ui.TextInput(
+            label=TYPE_ITEMS_LABELS.get(listing_type, TYPE_ITEMS_LABELS["SELL"]),
+            style=discord.TextStyle.paragraph,
+            placeholder=TYPE_ITEMS_PLACEHOLDERS.get(listing_type, TYPE_ITEMS_PLACEHOLDERS["SELL"]),
+            max_length=1000,
+        )
+        self.description = discord.ui.TextInput(
+            label="Description / Notes",
+            style=discord.TextStyle.paragraph,
+            placeholder="Condition, shipping info, extra details...",
+            max_length=500,
+            required=False,
+        )
         if prefill:
             self.items_and_prices.default = prefill.get("items_and_prices")
             self.description.default = prefill.get("description")
+        self.add_item(self.items_and_prices)
+        self.add_item(self.description)
 
     async def on_submit(self, interaction: discord.Interaction):
         items = parse_items(self.items_and_prices.value)
@@ -281,12 +321,14 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
             image_filenames=image_filenames,
             status="Pending Review",
             color=discord.Color.yellow(),
+            listing_type=self.listing_type,
         )
 
         view = ReviewView(
             author_id=interaction.user.id,
             items=items,
             description=self.description.value,
+            listing_type=self.listing_type,
         )
 
         mod_ping = f"<@&{MOD_ROLE_ID}>" if MOD_ROLE_ID else ""
@@ -294,7 +336,7 @@ class ListingModal(discord.ui.Modal, title="New Marketplace Listing"):
         # separate messages — combining files= and view= in one send has
         # been unreliable for actually attaching the files.
         sent_review_msg = await review_channel.send(
-            content=f"{mod_ping} 📥 New listing awaiting approval:",
+            content=f"{mod_ping} 📥 New {self.listing_type.lower()} listing awaiting approval:",
             embeds=embeds,
             files=photo_files,
         )
@@ -368,17 +410,19 @@ class ResubmitView(discord.ui.View):
 
     @discord.ui.button(label="Edit & Resubmit", style=discord.ButtonStyle.primary, emoji="✏️")
     async def edit_resubmit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ListingModal(prefill=self.prefill))
+        listing_type = self.prefill.get("listing_type", "SELL")
+        await interaction.response.send_modal(ListingModal(listing_type=listing_type, prefill=self.prefill))
 
 
 # ---------- Approve / Deny Buttons ----------
 
 class ReviewView(discord.ui.View):
-    def __init__(self, author_id: int, items: list, description: str):
+    def __init__(self, author_id: int, items: list, description: str, listing_type: str = "SELL"):
         super().__init__(timeout=None)
         self.author_id = author_id
         self.items = items
         self.description = description
+        self.listing_type = listing_type
         self.resolved = False  # guards against double Approve/Deny clicks
         self.listing_message_id = None  # set right after the listing message is sent
 
@@ -424,11 +468,13 @@ class ReviewView(discord.ui.View):
                 image_filenames=image_filenames,
                 status=f"Approved by {interaction.user.display_name}",
                 color=discord.Color.green(),
+                listing_type=self.listing_type,
             )
 
             if isinstance(forum_channel, discord.ForumChannel):
                 first_item = self.items[0][0] if self.items else "New Listing"
-                thread_name = f"{first_item} — {seller.display_name if seller else 'Seller'}"[:100]
+                tag = TYPE_TAGS.get(self.listing_type, "")
+                thread_name = f"{tag} {first_item} — {seller.display_name if seller else 'Seller'}".strip()[:100]
                 # Create the post with just a placeholder first, then send the
                 # real content as a follow-up — attaching files directly on
                 # ForumChannel.create_thread() is unreliable in discord.py.
@@ -490,6 +536,7 @@ class ReviewView(discord.ui.View):
         prefill = {
             "items_and_prices": items_text,
             "description": self.description,
+            "listing_type": self.listing_type,
         }
         try:
             await seller.send(embed=embed, view=ResubmitView(prefill=prefill))
@@ -517,9 +564,11 @@ class ReviewView(discord.ui.View):
 
 # ---------- Slash command entry point ----------
 
-@bot.tree.command(name="sell", description="Submit a marketplace listing for mod approval")
+@bot.tree.command(name="sell", description="Post a listing: sell, buy, or trade")
 async def sell(interaction: discord.Interaction):
-    await interaction.response.send_modal(ListingModal())
+    await interaction.response.send_message(
+        "What kind of listing is this?", view=ListingTypeView(), ephemeral=True
+    )
 
 
 @bot.tree.command(name="sold", description="Mark your listing as sold (run this inside your listing's post)")
